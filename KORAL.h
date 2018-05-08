@@ -159,6 +159,8 @@
 #include <cstring>
 #include <cuda_runtime.h>
 #include <vector>
+#include <chrono>
+using namespace std::chrono;
 
 class KORAL {
 	// public member variables
@@ -168,7 +170,6 @@ public:
 
 	// private member variables
 private:
-
 	struct Level {
 		uint8_t* d_img;
 		size_t pitch;
@@ -189,21 +190,29 @@ private:
 	const uint8_t scale_levels;
 	uint64_t* d_desc;
 	Keypoint* d_kps;
+	cudaArray* d_img_array;
+	cudaTextureObject_t* d_all_tex;
+	uint32_t* d_triplets;
+	cudaArray* d_trip_arr;
+	cudaStream_t* stream = new cudaStream_t[scale_levels - 1];
 
+	const unsigned int width;
+	const unsigned int height;
+	const unsigned int maxkp;
 	// public methods
 public:
-	KORAL(const float _scale_factor, const uint8_t _scale_levels) : scale_factor(_scale_factor), scale_levels(_scale_levels) {
-		// setting cache and shared modes
-		cudaDeviceSetCacheConfig(cudaFuncCachePreferEqual);
+	KORAL(const float _scale_factor, const uint8_t _scale_levels, const uint _width, const uint _height, const uint _maxkp) : 
+	scale_factor(_scale_factor), scale_levels(_scale_levels), width(_width), height(_height), maxkp(_maxkp)
+	{
+		// Setting cache and shared modes
+		//cudaDeviceSetCacheConfig(cudaFuncCachePreferEqual);
 		cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeFourByte);
 
-		// allocating and transferring triplets and binding to texture object
+		// Allocating and transferring triplets and binding to texture object
 		// for CLATCH
-		uint32_t* d_triplets;
 		cudaMalloc(&d_triplets, 2048 * sizeof(uint16_t));
 		cudaMemcpy(d_triplets, triplets, 2048 * sizeof(uint16_t), cudaMemcpyHostToDevice);
 		cudaChannelFormatDesc chandesc_trip = cudaCreateChannelDesc(16, 16, 16, 16, cudaChannelFormatKindUnsigned);
-		cudaArray* d_trip_arr;
 		cudaMallocArray(&d_trip_arr, &chandesc_trip, 512);
 		cudaMemcpyToArray(d_trip_arr, 0, 0, d_triplets, 2048 * sizeof(uint16_t), cudaMemcpyHostToDevice);
 		struct cudaResourceDesc resdesc_trip;
@@ -226,8 +235,40 @@ public:
 
 		chandesc_img = cudaCreateChannelDesc(8, 0, 0, 0, cudaChannelFormatKindUnsigned);
 
+		// Setup levels and pre-allocate GPU memory for scale space
+
 		levels = new Level[scale_levels];
 		all_tex = new cudaTextureObject_t[scale_levels];
+		cudaMalloc(&d_all_tex, scale_levels * sizeof(cudaTextureObject_t));
+		float f = 1.0f;
+		for (int i = 1; i < scale_levels; ++i) {
+			f *= scale_factor;
+			levels[i].w = static_cast<uint32_t>(static_cast<float>(width) / f + 0.5f);
+			levels[i].h = static_cast<uint32_t>(static_cast<float>(height) / f + 0.5f);
+			levels[i].total = static_cast<size_t>(levels[i].w)*static_cast<size_t>(levels[i].h);
+
+			levels[i].h_img = reinterpret_cast<uint8_t*>(malloc(levels[i].total + 1));
+			cudaMallocPitch(&levels[i].d_img, &levels[i].pitch, levels[i].w, levels[i].h);
+
+			struct cudaResourceDesc resdesc_img;
+			memset(&resdesc_img, 0, sizeof(resdesc_img));
+			resdesc_img.resType = cudaResourceTypePitch2D;
+			resdesc_img.res.pitch2D.desc = chandesc_img;
+			resdesc_img.res.pitch2D.devPtr = levels[i].d_img;
+			resdesc_img.res.pitch2D.height = levels[i].h;
+			resdesc_img.res.pitch2D.pitchInBytes = levels[i].pitch;
+			resdesc_img.res.pitch2D.width = levels[i].w;
+			cudaCreateTextureObject(&all_tex[i], &resdesc_img, &texdesc_img, nullptr);
+		}
+
+		for (int i = 0; i < scale_levels - 1; ++i) {
+			cudaStreamCreate(stream + i);
+		}
+
+		// Pre-allocate memory for storing descriptors and keypoint coordinates
+		cudaMalloc(&d_desc, 64 * maxkp);
+		cudaMalloc(&d_kps, maxkp * sizeof(Keypoint));
+		cudaMallocArray(&d_img_array, &chandesc_img, width, height, cudaArrayTextureGather);
 	}
 
 	~KORAL() {
@@ -235,20 +276,35 @@ public:
 		delete[] all_tex;
 	}
 
-	void go(const uint8_t* image, const uint32_t width, const uint32_t height, const uint8_t KFAST_thresh) {
+	void freeGPUMemory()
+	{
+		cudaFree(d_desc);
+		cudaFree(d_kps);
+		cudaFree(d_all_tex);
+		for (uint8_t i = 0; i < scale_levels; ++i) {
+			cudaFree(levels[i].d_img);
+		}
+
+		cudaFree(d_triplets);
+		cudaFree(d_trip_arr);
+	}
+
+	void go(const uint8_t* image, const uint32_t width, const uint32_t height, const uint8_t KFAST_thresh) 
+	{
+		// Clear keypoints, assign image and characteristics to the topmost level
+
 		kps.clear();
 		levels[0].h_img = image;
 		levels[0].w = width;
 		levels[0].h = height;
 		levels[0].total = static_cast<size_t>(width) * static_cast<size_t>(height);
 
-		// allocating and transferring original image as cudaArray
+		// Transfer original image as cudaArray
 		// and binding to texture object, one as normalized float (for LERP),
 		// one as ElementType (for CLATCH)
+		
 		cudaTextureObject_t d_img_tex_nf;
-		{
-			cudaArray* d_img_array;
-			cudaMallocArray(&d_img_array, &chandesc_img, width, height, cudaArrayTextureGather);
+		{			
 			cudaMemcpyToArray(d_img_array, 0, 0, image, levels[0].total, cudaMemcpyHostToDevice);
 			struct cudaResourceDesc resdesc_img;
 			memset(&resdesc_img, 0, sizeof(resdesc_img));
@@ -263,43 +319,22 @@ public:
 			texdesc_img.readMode = cudaReadModeElementType;
 			cudaCreateTextureObject(&all_tex[0], &resdesc_img, &texdesc_img, nullptr);
 		}
-
-		cudaStream_t* stream = new cudaStream_t[scale_levels - 1];
-		for (int i = 0; i < scale_levels - 1; ++i) {
-			cudaStreamCreate(stream + i);
-		}
-
-		// prepare 7 more scales as 2D pitched linear
+	
+		// Prepare the additional scales
 		// and bind to ElementType textures
 		float f = 1.0f;
 		for (int i = 1; i < scale_levels; ++i) {
-			f *= scale_factor;
-			levels[i].w = static_cast<uint32_t>(static_cast<float>(width) / f + 0.5f);
-			levels[i].h = static_cast<uint32_t>(static_cast<float>(height) / f + 0.5f);
-			levels[i].total = static_cast<size_t>(levels[i].w)*static_cast<size_t>(levels[i].h);
-
-			levels[i].h_img = reinterpret_cast<uint8_t*>(malloc(levels[i].total + 1));
-
-			cudaMallocPitch(&levels[i].d_img, &levels[i].pitch, levels[i].w, levels[i].h);
-
-			struct cudaResourceDesc resdesc_img;
-			memset(&resdesc_img, 0, sizeof(resdesc_img));
-			resdesc_img.resType = cudaResourceTypePitch2D;
-			resdesc_img.res.pitch2D.desc = chandesc_img;
-			resdesc_img.res.pitch2D.devPtr = levels[i].d_img;
-			resdesc_img.res.pitch2D.height = levels[i].h;
-			resdesc_img.res.pitch2D.pitchInBytes = levels[i].pitch;
-			resdesc_img.res.pitch2D.width = levels[i].w;
-			cudaCreateTextureObject(&all_tex[i], &resdesc_img, &texdesc_img, nullptr);
-
+			f *= scale_factor;			
+			cudaMemset2DAsync(levels[i].d_img, levels[i].pitch, 0, levels[i].w, levels[i].h, stream[i - 1]);
 			// GPU: non-blocking launch of resize kernels
 			CUDALERP(d_img_tex_nf, f, f, levels[i].d_img, levels[i].pitch, levels[i].w, levels[i].h, stream[i - 1]);
 		}
 
-		// meanwhile, CPU, get started on KFAST
+		// Initialize KFAST on the CPU
 
-		// bring in downscale results from GPU (except for first level) and operate on them
-		// as they arrive
+		// Bring in downscale results from GPU (except for first level) 
+		// and operate on them as they arrive
+
 		for (uint8_t i = 0; i < scale_levels; ++i) {
 			std::vector<Keypoint> local_kps;
 			if (i) {
@@ -317,46 +352,19 @@ public:
 			kps.insert(kps.end(), local_kps.begin(), local_kps.end());
 		}
 
-		// Describe
-
-		// allocating space for descriptors
-		cudaMalloc(&d_desc, 64 * kps.size());
-
-		// allocating and transferring keypoints and binding to texture object
-		cudaMalloc(&d_kps, kps.size() * sizeof(Keypoint));
-		cudaMemcpy(d_kps, kps.data(), kps.size() * sizeof(Keypoint), cudaMemcpyHostToDevice);
-
-		// transfer tex
-		cudaTextureObject_t* d_all_tex;
-		cudaMalloc(&d_all_tex, scale_levels * sizeof(cudaTextureObject_t));
-		cudaMemcpy(d_all_tex, all_tex, scale_levels * sizeof(cudaTextureObject_t), cudaMemcpyHostToDevice);
+		// Compute LATCH descriptors for all the keypoints
 
 		CLATCH(d_all_tex, d_trip_tex, d_kps, static_cast<int>(kps.size()), d_desc);
 
-		// transfer descriptors
+		// Transfer descriptors to host
 
 		desc.clear();
 		desc.resize(8 * kps.size());
 		cudaMemcpy(&desc[0], d_desc, 64 * kps.size(), cudaMemcpyDeviceToHost);
-
-		//for (int i = 0; i < scale_levels; ++i) {
-		//	std::vector<cv::KeyPoint> converted_kps;
-		//	for (const auto& kp : kps) if (kp.scale == i) converted_kps.emplace_back(static_cast<float>(kp.x), static_cast<float>(kp.y), 14.0f, 180.0f/3.1415926535f*kp.angle, static_cast<float>(kp.score));
-		//	cv::Mat image_with_kps;
-		//	cv::Mat raw_img(static_cast<int>(levels[i].h), static_cast<int>(levels[i].w), CV_8U, const_cast<uint8_t*>(levels[i].h_img), levels[i].w);
-		//	cv::drawKeypoints(raw_img, converted_kps, image_with_kps, { 255.0, 0.0, 0.0 }, 4);
-		//	cv::namedWindow(std::to_string(i), CV_WINDOW_AUTOSIZE);
-		//	cv::imshow(std::to_string(i), image_with_kps);
-		//}
-		//cv::waitKey(0);
-
+		
 		cudaDeviceSynchronize();
-		//cudaDeviceReset();
 	}
 
-	// private methods
 private:
-
-
 
 };

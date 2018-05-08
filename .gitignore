@@ -1,4 +1,4 @@
-*
+build/
 !.gitignore
 !CLATCH.cu
 !CLATCH.h
