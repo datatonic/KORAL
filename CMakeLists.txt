@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 2.8.3)
-project(detector)
+project(koralTest)
 
 FIND_PACKAGE(CUDA REQUIRED)
 FIND_PACKAGE(OpenCV REQUIRED)
@@ -10,12 +10,12 @@ SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Ofast -std=c++11 -march=native -funroll
 SET(CUDA_NVCC_FLAGS "-arch=${ARCH} --use_fast_math -O3" CACHE STRING "nvcc flags" FORCE)
 SET (CUDA_VERBOSE_BUILD ON CACHE BOOL "nvcc verbose" FORCE)
 SET(LIB_TYPE STATIC) 
-CUDA_ADD_LIBRARY(koral ${LIB_TYPE} CUDALERP.cu CLATCH.cu)
+CUDA_ADD_LIBRARY(koral ${LIB_TYPE} CUDALERP.cu CLATCH.cu CUDAK2NN.cu)
 
-add_executable(detector_node main.cpp)
-add_dependencies(detector_node koral)
+add_executable(koralTest main.cpp)
+add_dependencies(koralTest koral)
 
-target_link_libraries(detector_node
+target_link_libraries(koralTest
   koral
   ${OpenCV_LIBS}
  )

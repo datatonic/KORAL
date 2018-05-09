@@ -353,7 +353,8 @@ public:
 		}
 
 		// Compute LATCH descriptors for all the keypoints
-
+		cudaMemcpy(d_all_tex, all_tex, scale_levels * sizeof(cudaTextureObject_t), cudaMemcpyHostToDevice);
+		cudaMemcpy(d_kps, kps.data(), kps.size() * sizeof(Keypoint), cudaMemcpyHostToDevice);
 		CLATCH(d_all_tex, d_trip_tex, d_kps, static_cast<int>(kps.size()), d_desc);
 
 		// Transfer descriptors to host
